@@ -119,7 +119,9 @@ unsafe impl Sync for SystemBox {}
 
 impl SystemBox {
     #[cfg(feature = "par-schedule")]
-    unsafe fn get(&self) -> &dyn Schedulable { std::ops::Deref::deref(&*self.0.get()) }
+    unsafe fn get(&self) -> &dyn Schedulable {
+        std::ops::Deref::deref(&*self.0.get())
+    }
 
     #[allow(clippy::mut_from_ref)]
     unsafe fn get_mut(&self) -> &mut dyn Schedulable {
@@ -469,13 +471,16 @@ impl Builder {
     }
 
     /// Adds a thread local system to the schedule. This system will be executed on the main thread.
-    pub fn add_thread_local<S: Into<Box<dyn Runnable>>>(self, system: S) -> Self {
-        let mut system = system.into();
-        self.add_thread_local_fn(move |world, resources| system.run(world, resources))
+    pub fn add_thread_local<S: Into<Box<dyn Runnable>>>(mut self, system: S) -> Self {
+        let system = system.into();
+        self.steps.push(Step::ThreadLocalSystem(system));
+        self
     }
 
     /// Finalizes the builder into a `Schedule`.
-    pub fn build(self) -> Schedule { self.into() }
+    pub fn build(self) -> Schedule {
+        self.into()
+    }
 }
 
 impl Default for Builder {
@@ -495,6 +500,8 @@ pub enum Step {
     FlushCmdBuffers,
     /// A thread local function.
     ThreadLocalFn(Box<dyn FnMut(&mut World, &mut Resources)>),
+    /// A thread local function.
+    ThreadLocalSystem(Box<dyn Runnable>),
 }
 
 /// A schedule of systems for execution.
@@ -524,27 +531,47 @@ pub struct Schedule {
 
 impl Schedule {
     /// Creates a new schedule builder.
-    pub fn builder() -> Builder { Builder::default() }
+    pub fn builder() -> Builder {
+        Builder::default()
+    }
 
     /// Executes all of the steps in the schedule.
     pub fn execute(&mut self, world: &mut World, resources: &mut Resources) {
         let mut waiting_flush: Vec<&mut Executor> = Vec::new();
+        let mut thread_local_systems: Vec<&mut Box<dyn Runnable>> = Vec::new();
+
         for step in &mut self.steps {
             match step {
                 Step::Systems(executor) => {
                     executor.run_systems(world, resources);
                     waiting_flush.push(executor);
                 }
-                Step::FlushCmdBuffers => waiting_flush
-                    .drain(..)
-                    .for_each(|e| e.flush_command_buffers(world)),
+                Step::FlushCmdBuffers => {
+                    waiting_flush
+                        .drain(..)
+                        .for_each(|e| e.flush_command_buffers(world));
+
+                    thread_local_systems
+                        .drain(..)
+                        .for_each(|s| if let Some(mut cmd) = s.command_buffer_mut(world.id()) {
+                            cmd.write(world)
+                        });
+                }
                 Step::ThreadLocalFn(function) => function(world, resources),
+                Step::ThreadLocalSystem(system) => {
+                    system.run(world, resources);
+                    if system.command_buffer_mut(world.id()).is_some() {
+                        thread_local_systems.push(system);
+                    }
+                }
             }
         }
     }
 
     /// Converts the schedule into a vector of steps.
-    pub fn into_vec(self) -> Vec<Step> { self.steps }
+    pub fn into_vec(self) -> Vec<Step> {
+        self.steps
+    }
 }
 
 impl From<Builder> for Schedule {
@@ -556,7 +583,9 @@ impl From<Builder> for Schedule {
 }
 
 impl From<Vec<Step>> for Schedule {
-    fn from(steps: Vec<Step>) -> Self { Self { steps } }
+    fn from(steps: Vec<Step>) -> Self {
+        Self { steps }
+    }
 }
 
 #[cfg(test)]
@@ -635,3 +664,4 @@ mod tests {
         schedule.execute(&mut world, &mut resources);
     }
 }
+
